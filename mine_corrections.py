@@ -93,6 +93,169 @@ let lets like actually instead rather stop always never remember told said say s
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._+-]*")
 
+# --------------------------------------------------------------------------- #
+# Configuration Loading
+# --------------------------------------------------------------------------- #
+
+def resolve_config_path(override: str | None = None) -> Path | None:
+    """Find the most appropriate config file (local first, then global fallback)."""
+    if override:
+        return Path(override)
+    for p in [Path("config.yaml"), Path("config.json"), Path.home() / ".claude" / "miner_config.json"]:
+        if p.exists():
+            return p
+    return None
+
+def get_default_save_path() -> Path:
+    """Returns the default global location for saving config."""
+    global_dir = Path.home() / ".claude"
+    global_dir.mkdir(parents=True, exist_ok=True)
+    return global_dir / "miner_config.json"
+
+def load_config(config_path: Path) -> dict:
+    """Load overrides from a JSON or YAML config file."""
+    global PATTERNS, COMPILED, STOPWORDS
+    
+    if not config_path.is_file():
+        return {}
+        
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            if config_path.suffix in (".yaml", ".yml"):
+                try:
+                    import yaml
+                    data = yaml.safe_load(f)
+                except ImportError:
+                    print(f"Warning: PyYAML not installed. Cannot parse {config_path.name}.", file=sys.stderr)
+                    return {}
+            else:
+                data = json.load(f)
+                
+        if not isinstance(data, dict):
+            return {}
+            
+        if "stop_words" in data:
+            if isinstance(data["stop_words"], list):
+                STOPWORDS = set(data["stop_words"])
+            elif isinstance(data["stop_words"], str):
+                STOPWORDS = set(data["stop_words"].split())
+                
+        if "scoring_weights" in data or "patterns" in data:
+            new_patterns = data.get("scoring_weights", data.get("patterns"))
+            if isinstance(new_patterns, list):
+                PATTERNS = []
+                for p in new_patterns:
+                    if isinstance(p, dict) and "pattern" in p and "weight" in p and "tag" in p:
+                        PATTERNS.append((p["pattern"], float(p["weight"]), p["tag"]))
+                    elif isinstance(p, list) and len(p) >= 3:
+                        PATTERNS.append((p[0], float(p[1]), p[2]))
+                COMPILED = [(re.compile(p, re.I), w, tag) for p, w, tag in PATTERNS]
+                
+        return data
+    except Exception as e:
+        print(f"Error loading config {config_path}: {e}", file=sys.stderr)
+        return {}
+
+def save_config(config_path: Path, data: dict):
+    """Save configuration to JSON or YAML."""
+    try:
+        with config_path.open("w", encoding="utf-8") as f:
+            if config_path.suffix in (".yaml", ".yml"):
+                import yaml
+                yaml.dump(data, f, default_flow_style=False)
+            else:
+                json.dump(data, f, indent=4)
+    except Exception as e:
+        print(f"Error saving config {config_path}: {e}", file=sys.stderr)
+
+def add_stopword_to_config(config_path: Path, word: str):
+    """Adds a stop word to the config file directly."""
+    data = {}
+    if config_path.is_file():
+        try:
+            with config_path.open("r", encoding="utf-8") as f:
+                if config_path.suffix in (".yaml", ".yml"):
+                    import yaml
+                    data = yaml.safe_load(f) or {}
+                else:
+                    data = json.load(f)
+        except Exception:
+            pass
+            
+    if not isinstance(data, dict):
+        data = {}
+        
+    current = data.get("stop_words", list(STOPWORDS))
+    if isinstance(current, str):
+        current = current.split()
+    elif isinstance(current, set):
+        current = list(current)
+        
+    if word not in current:
+        current.append(word)
+        data["stop_words"] = sorted(list(set(current)))
+        save_config(config_path, data)
+        return True
+    return False
+
+def remove_stopword_from_config(config_path: Path, word: str):
+    """Removes a stop word from the config file directly."""
+    data = {}
+    if config_path.is_file():
+        try:
+            with config_path.open("r", encoding="utf-8") as f:
+                if config_path.suffix in (".yaml", ".yml"):
+                    import yaml
+                    data = yaml.safe_load(f) or {}
+                else:
+                    data = json.load(f)
+        except Exception:
+            pass
+            
+    if not isinstance(data, dict):
+        data = {}
+        
+    current = data.get("stop_words", list(STOPWORDS))
+    if isinstance(current, str):
+        current = current.split()
+    elif isinstance(current, set):
+        current = list(current)
+        
+    if word in current:
+        current.remove(word)
+        data["stop_words"] = sorted(list(set(current)))
+        save_config(config_path, data)
+        return True
+    return False
+
+def add_pattern_to_config(config_path: Path, pattern: str, weight: float, tag: str):
+    """Adds a new scoring pattern to the config file directly."""
+    data = {}
+    if config_path.is_file():
+        try:
+            with config_path.open("r", encoding="utf-8") as f:
+                if config_path.suffix in (".yaml", ".yml"):
+                    import yaml
+                    data = yaml.safe_load(f) or {}
+                else:
+                    data = json.load(f)
+        except Exception:
+            pass
+            
+    if not isinstance(data, dict):
+        data = {}
+        
+    current = data.get("patterns", [{"pattern": p, "weight": w, "tag": t} for p, w, t in PATTERNS])
+    
+    # Check if pattern already exists
+    for p in current:
+        if p.get("pattern") == pattern:
+            return False
+            
+    current.append({"pattern": pattern, "weight": weight, "tag": tag})
+    data["patterns"] = current
+    save_config(config_path, data)
+    return True
 
 # --------------------------------------------------------------------------- #
 # Transcript parsing
@@ -536,6 +699,7 @@ confidence. Then wait for me to approve line by line.
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", help="Path to config.json or config.yaml")
     ap.add_argument("--tool", default="claude", choices=["claude", "codex", "cursor", "windsurf"],
                     help="Which AI assistant tool to mine history for (default: claude)")
     ap.add_argument("--root", default=None,
@@ -554,8 +718,58 @@ def main() -> int:
     ap.add_argument("--memory-only", action="store_true")
     ap.add_argument("--include-project-memory", action="store_true",
                     help="also read type: project memory (state logs)")
+    ap.add_argument("--show-stopwords", action="store_true", help="Print the current list of stop words and exit")
+    ap.add_argument("--add-stopword", type=str, metavar="WORD", help="Add a custom stop word to the config file and exit")
+    ap.add_argument("--remove-stopword", type=str, metavar="WORD", help="Remove a stop word from the config file and exit")
+    ap.add_argument("--init-config", action="store_true", help="Generate a default config file (miner_config.json) in ~/.claude/ and exit")
     ap.add_argument("-v", "--verbose", action="store_true")
+
+    args, _ = ap.parse_known_args()
+    config_path = resolve_config_path(args.config)
+                
+    if config_path:
+        config_data = load_config(config_path)
+        if config_data:
+            if "retention_window_days" in config_data:
+                ap.set_defaults(half_life=float(config_data["retention_window_days"]))
+            elif "half_life" in config_data:
+                ap.set_defaults(half_life=float(config_data["half_life"]))
+                
     args = ap.parse_args()
+
+    if args.init_config:
+        target = get_default_save_path()
+        save_config(target, {
+            "retention_window_days": 90.0,
+            "stop_words": sorted(list(STOPWORDS)),
+            "patterns": [{"pattern": p, "weight": w, "tag": t} for p, w, t in PATTERNS]
+        })
+        print(f"Initialized default configuration at {target}")
+        return 0
+
+    # Handle stop word management
+    if args.show_stopwords:
+        print("Current Stop Words:")
+        print(", ".join(sorted(list(STOPWORDS))))
+        return 0
+        
+    if args.add_stopword:
+        target_conf = config_path if config_path else get_default_save_path()
+        word = args.add_stopword.strip().lower()
+        if add_stopword_to_config(target_conf, word):
+            print(f"Successfully added '{word}' to stop words in {target_conf}.")
+        else:
+            print(f"'{word}' is already in the stop words list.")
+        return 0
+        
+    if args.remove_stopword:
+        target_conf = config_path if config_path else get_default_save_path()
+        word = args.remove_stopword.strip().lower()
+        if remove_stopword_from_config(target_conf, word):
+            print(f"Successfully removed '{word}' from stop words in {target_conf}.")
+        else:
+            print(f"'{word}' was not found in the stop words list.")
+        return 0
 
     provider = get_provider(args.tool)
     root_str = args.root if args.root is not None else str(provider.get_default_root())
