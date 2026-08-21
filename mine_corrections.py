@@ -35,24 +35,42 @@ from pathlib import Path
 # carry the rule, which is precisely what we want to capture.
 
 PATTERNS: list[tuple[str, float, str]] = [
+    # --- repetition: strongest signal, a rule that failed to persist ----- #
     (r"\bi (?:already )?told you\b",                    3.0, "repetition"),
-    (r"\b(?:i said|as i said)\b",                       2.5, "repetition"),
-    (r"\bagain[,.!]",                                   2.0, "repetition"),
-    (r"\bstop (?:doing|adding|using|trying)\b",         2.5, "prohibition"),
-    (r"\b(?:never|do not ever) (?:use|do|add|write)\b",  2.5, "prohibition"),
-    (r"\b(?:don'?t|do not) (?:use|add|write|create|touch|change|refactor)\b",
-                                                         2.0, "prohibition"),
-    (r"\balways (?:use|run|prefer|check|add)\b",         2.0, "directive"),
-    (r"\bwe (?:use|prefer|don'?t use|never use)\b",      2.0, "convention"),
-    (r"\buse \S+ (?:not|instead of) \S+",               2.0, "convention"),
-    (r"\b(?:instead of|rather than)\b",                 1.2, "convention"),
-    (r"\bactually,?\b",                                 1.0, "correction"),
-    (r"\bthat'?s (?:not|wrong|incorrect)\b",            1.5, "correction"),
-    (r"\b(?:no|nope)[,.!]",                             1.2, "correction"),
-    (r"\bwhy (?:did|are) you\b",                        1.5, "correction"),
-    (r"\b(?:revert|undo) (?:that|this|it)\b",           1.5, "correction"),
-    (r"\bremember (?:that|to)?\b",                      1.5, "directive"),
-    (r"\b(?:please )?just \S+",                         0.8, "directive"),
+    (r"\b(?:from now on|going forward)\b",              2.8, "repetition"),
+    (r"\bevery (?:time|single time)\b",                 2.2, "repetition"),
+    (r"\b(?:i said|as i said|like i said)\b",           2.5, "repetition"),
+    (r"\bagain\b",                                      1.0, "repetition"),
+    # --- stated preference: how delegators express rules ----------------- #
+    (r"\bi don'?t want\b",                              2.4, "preference"),
+    (r"\bi (?:just )?want (?:you to |it to |to see )?",  1.4, "preference"),
+    (r"\bi (?:like|prefer) (?:it |for it |that )?",      2.2, "preference"),
+    (r"\bdon'?t (?:give|show|include|add|send) me\b",    2.2, "preference"),
+    (r"\bno (?:next steps|preamble|fluff|filler|summary)\b", 2.8, "preference"),
+    (r"\b(?:super |keep it |be )brief\b",               2.0, "preference"),
+    (r"\bseems? (?:un+ecc?ess?ary|redundant|excessive|too long|tedious)\b",
+                                                        2.0, "preference"),
+    (r"\bin (?:simplified|simpler|plain) terms\b",      1.8, "preference"),
+    (r"\bkeep it \S+",                                  1.6, "preference"),
+    (r"\bmake sure\b",                                  1.2, "preference"),
+    (r"\bunless there'?s\b",                            1.4, "preference"),
+    # --- prohibition ----------------------------------------------------- #
+    (r"\bstop (?:doing|adding|using|trying|it)\b",      2.5, "prohibition"),
+    (r"\bstop\b",                                       1.4, "prohibition"),
+    (r"\bnever (?:use|do|add|write|touch)\b",           2.5, "prohibition"),
+    (r"\b(?:don'?t|do not) (?:use|add|write|create|touch|change|refactor|bother)\b",
+                                                        2.0, "prohibition"),
+    # --- convention ------------------------------------------------------ #
+    (r"\bwe (?:use|prefer|don'?t use|never use|always)\b", 2.0, "convention"),
+    (r"\buse \S+ (?:not|instead of|over|rather than) \S+", 2.0, "convention"),
+    (r"\b(?:instead of|rather than)\b",                 1.0, "convention"),
+    # --- correction ------------------------------------------------------ #
+    (r"^(?:no|nope|nah)\b",                             2.0, "correction"),
+    (r"\bactually\b",                                   0.8, "correction"),
+    (r"\bthat'?s (?:not|wrong|incorrect|still)\b",      1.6, "correction"),
+    (r"\bwhy (?:did|are|would|is) (?:you|it)\b",        1.5, "correction"),
+    (r"\b(?:revert|undo|roll back)\b",                  1.5, "correction"),
+    (r"\bremember\b",                                   1.5, "directive"),
 ]
 COMPILED = [(re.compile(p, re.I), w, tag) for p, w, tag in PATTERNS]
 
@@ -120,27 +138,130 @@ def parse_ts(raw) -> datetime | None:
         return None
 
 
-def iter_user_turns(path: Path):
-    """Yield (line_no, text, timestamp, cwd) for genuine user turns."""
-    try:
-        fh = path.open("r", encoding="utf-8", errors="replace")
-    except OSError:
-        return
-    with fh:
-        for lineno, line in enumerate(fh, 1):
-            line = line.strip()
-            if not line or line[0] != "{":
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if rec.get("type") != "user" or rec.get("isMeta"):
-                continue
-            text = extract_text(rec.get("message"))
-            if not text or is_noise(text):
-                continue
-            yield lineno, text, parse_ts(rec.get("timestamp")), rec.get("cwd")
+class HistoryProvider:
+    """Base class for different AI tool history parsers."""
+    
+    @classmethod
+    def get_default_root(cls) -> Path:
+        raise NotImplementedError
+
+    def get_sessions(self, root: Path) -> list[Path]:
+        raise NotImplementedError
+        
+    def iter_user_turns(self, session_path: Path):
+        """Yield (line_no, text, timestamp, cwd) for genuine user turns."""
+        raise NotImplementedError
+
+
+class ClaudeProvider(HistoryProvider):
+    @classmethod
+    def get_default_root(cls) -> Path:
+        return Path.home() / ".claude"
+
+    def get_sessions(self, root: Path) -> list[Path]:
+        return sorted(root.glob("projects/*/*.jsonl"))
+
+    def iter_user_turns(self, path: Path):
+        try:
+            fh = path.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        with fh:
+            for lineno, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line or line[0] != "{":
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") != "user" or rec.get("isMeta"):
+                    continue
+                text = extract_text(rec.get("message"))
+                if not text or is_noise(text):
+                    continue
+                yield lineno, text, parse_ts(rec.get("timestamp")), rec.get("cwd")
+
+
+class CodexProvider(HistoryProvider):
+    @classmethod
+    def get_default_root(cls) -> Path:
+        return Path.home() / ".codex"
+
+    def get_sessions(self, root: Path) -> list[Path]:
+        return sorted(root.glob("sessions/*/*/*/*.jsonl"))
+
+    def iter_user_turns(self, path: Path):
+        try:
+            fh = path.open("r", encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        
+        current_cwd = None
+        with fh:
+            for lineno, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line or line[0] != "{":
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                    
+                rec_type = rec.get("type")
+                
+                if rec_type == "turn_context":
+                    payload = rec.get("payload", {})
+                    current_cwd = payload.get("cwd", current_cwd)
+                    continue
+                    
+                if rec_type == "event_msg":
+                    payload = rec.get("payload", {})
+                    if payload.get("type") == "user_message":
+                        text = payload.get("message")
+                        if not text or is_noise(text):
+                            continue
+                        yield lineno, text, parse_ts(rec.get("timestamp")), current_cwd
+
+
+class CursorProvider(HistoryProvider):
+    @classmethod
+    def get_default_root(cls) -> Path:
+        if sys.platform == "win32":
+            return Path(os.environ.get("APPDATA", "")) / "Cursor" / "User" / "workspaceStorage"
+        elif sys.platform == "darwin":
+            return Path.home() / "Library" / "Application Support" / "Cursor" / "User" / "workspaceStorage"
+        return Path.home() / ".config" / "Cursor" / "User" / "workspaceStorage"
+
+    def get_sessions(self, root: Path) -> list[Path]:
+        print("Note: Cursor support is currently a stub. Implementing SQLite parsing soon.", file=sys.stderr)
+        return []
+
+    def iter_user_turns(self, path: Path):
+        yield from []
+
+
+class WindsurfProvider(HistoryProvider):
+    @classmethod
+    def get_default_root(cls) -> Path:
+        return Path.home() / ".codeium" / "windsurf"
+
+    def get_sessions(self, root: Path) -> list[Path]:
+        print("Note: Windsurf support is currently a stub.", file=sys.stderr)
+        return []
+
+    def iter_user_turns(self, path: Path):
+        yield from []
+
+
+def get_provider(name: str) -> HistoryProvider:
+    providers = {
+        "claude": ClaudeProvider(),
+        "codex": CodexProvider(),
+        "cursor": CursorProvider(),
+        "windsurf": WindsurfProvider()
+    }
+    return providers.get(name.lower(), ClaudeProvider())
 
 
 # --------------------------------------------------------------------------- #
@@ -208,49 +329,116 @@ def cluster(items: list[dict], threshold: float, min_shared: int) -> list[dict]:
 # Auto memory collation
 # --------------------------------------------------------------------------- #
 
-FRONTMATTER_MODIFIED = re.compile(r"^modified:\s*(\S+)", re.M)
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Minimal indent-aware YAML frontmatter reader (nested keys flattened)."""
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}, text
+    head, body = text[3:end], text[end + 4:]
+    fields: dict[str, str] = {}
+    for line in head.splitlines():
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        m = re.match(r"^\s*([A-Za-z_][\w-]*):\s*(.*)$", line)
+        if m:
+            key, val = m.group(1), m.group(2).strip().strip("\"'")
+            if val:                 # skip bare parent keys such as "metadata:"
+                fields[key] = val
+    return fields, body
 
 
-def read_memory(root: Path) -> list[dict]:
-    """Collect auto-memory lines per project, with the `modified` stamp if present."""
+def read_memory(root: Path, include_project: bool = False) -> list[dict]:
+    """Read auto-memory nodes, split by their declared `type`.
+
+    Nodes tagged `type: feedback` are preferences — the only ones that belong in
+    a universal CLAUDE.md. Nodes tagged `type: project` are state logs (build
+    history, fixes, architecture); excluded by default, since that content is
+    derivable from the codebase and would only waste context.
+    """
     out = []
     for mem_dir in sorted(root.glob("projects/*/memory")):
         project = mem_dir.parent.name
         for md in sorted(mem_dir.rglob("*.md")):
             try:
-                body = md.read_text(encoding="utf-8", errors="replace")
+                raw = md.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            m = FRONTMATTER_MODIFIED.search(body[:600])
-            modified = m.group(1) if m else None
-            for line in body.splitlines():
-                line = line.strip().lstrip("-*").strip()
-                if len(line) < 12 or line.startswith(("#", "```", "---", "modified:")):
-                    continue
-                out.append({
-                    "project": project,
-                    "file": str(md),
-                    "modified": modified,
-                    "text": line,
-                    "tokens": content_tokens(line),
-                })
+            fm, body = parse_frontmatter(raw)
+            node_type = (fm.get("type") or "").lower()
+            if node_type != "feedback" and not include_project:
+                continue
+            body_clean = "\n".join(l.rstrip() for l in body.splitlines()
+                                   if l.strip()).strip()
+            out.append({
+                "project": project,
+                "file": str(md),
+                "name": fm.get("name") or md.stem,
+                "description": fm.get("description", ""),
+                "node_type": node_type or "untyped",
+                "modified": fm.get("modified"),
+                "text": body_clean[:800],
+                "tokens": content_tokens(
+                    (fm.get("name", "") + " " + fm.get("description", "") + " "
+                     + body_clean[:800]).replace("-", " ")),
+            })
     return out
+
+
+def verbatim_repeats(items: list[dict], min_sessions: int = 2) -> list[dict]:
+    """Identical turns across separate sessions: the strongest possible signal."""
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for it in items:
+        key = re.sub(r"\s+", " ", it["text"].lower()).strip()[:200]
+        groups[key].append(it)
+    out = []
+    for group in groups.values():
+        if len({g["session"] for g in group}) < min_sessions:
+            continue
+        out.append({
+            "text": group[0]["text"],
+            "times": len(group),
+            "sessions": len({g["session"] for g in group}),
+            "projects": sorted({g["project"] for g in group}),
+            "citations": [g["citation"] for g in group[:4]],
+        })
+    out.sort(key=lambda r: -r["times"])
+    return out
+
+
+def project_independence_warning(projects) -> list:
+    """Flag project pairs that look like the same work under two folder names.
+
+    Cross-project recurrence is only evidence if the projects are independent.
+    """
+    labels = sorted(projects)
+    pairs = []
+    for i, a in enumerate(labels):
+        ta = content_tokens(a.replace("-", " ").replace("/", " ").lower())
+        for b in labels[i + 1:]:
+            tb = content_tokens(b.replace("-", " ").replace("/", " ").lower())
+            if not ta or not tb:
+                continue
+            if len(ta & tb) / max(len(ta | tb), 1) >= 0.4:
+                pairs.append((a, b))
+    return pairs
 
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 
-def collect_transcripts(root: Path, min_score: float, max_chars: int, now: datetime,
+def collect_transcripts(provider: HistoryProvider, root: Path, min_score: float, max_chars: int, now: datetime,
                         half_life: float, verbose: bool) -> tuple[list[dict], dict]:
     items: list[dict] = []
     stats = {"sessions": 0, "user_turns": 0, "projects": set(), "hits": 0}
 
-    for session in sorted(root.glob("projects/*/*.jsonl")):
+    for session in provider.get_sessions(root):
         stats["sessions"] += 1
         project_dir = session.parent.name
         project_label = None
-        for lineno, text, ts, cwd in iter_user_turns(session):
+        for lineno, text, ts, cwd in provider.iter_user_turns(session):
             stats["user_turns"] += 1
             if cwd and not project_label:
                 project_label = cwd
@@ -348,13 +536,15 @@ confidence. Then wait for me to approve line by line.
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", default=str(Path.home() / ".claude"),
-                    help="Claude Code data dir (default: ~/.claude)")
+    ap.add_argument("--tool", default="claude", choices=["claude", "codex", "cursor", "windsurf"],
+                    help="Which AI assistant tool to mine history for (default: claude)")
+    ap.add_argument("--root", default=None,
+                    help="Data dir (default: depends on tool, e.g. ~/.claude)")
     ap.add_argument("--out", help="directory to write candidates.json + REVIEW.md")
-    ap.add_argument("--min-score", type=float, default=2.0)
+    ap.add_argument("--min-score", type=float, default=1.0)
     ap.add_argument("--min-projects", type=int, default=2,
                     help="universality bar: distinct projects a rule must appear in")
-    ap.add_argument("--max-chars", type=int, default=600,
+    ap.add_argument("--max-chars", type=int, default=1200,
                     help="ignore user turns longer than this (specs, pasted logs)")
     ap.add_argument("--half-life", type=float, default=90.0,
                     help="recency half-life in days")
@@ -362,21 +552,31 @@ def main() -> int:
     ap.add_argument("--min-shared", type=int, default=2)
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--memory-only", action="store_true")
+    ap.add_argument("--include-project-memory", action="store_true",
+                    help="also read type: project memory (state logs)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
-    root = Path(args.root).expanduser()
-    if not (root / "projects").is_dir():
+    provider = get_provider(args.tool)
+    root_str = args.root if args.root is not None else str(provider.get_default_root())
+    root = Path(root_str).expanduser()
+    
+    if args.tool == "claude" and not (root / "projects").is_dir():
         print(f"error: no projects/ under {root}", file=sys.stderr)
         return 1
 
     now = datetime.now(timezone.utc)
 
     # --- auto memory (survives the retention sweep; use as hypotheses) ------- #
-    mem = read_memory(root)
+    mem = read_memory(root, include_project=args.include_project_memory)
     mem_clusters = cluster(
         [{**m, "weighted": 1.0} for m in mem], args.similarity, args.min_shared
     )
+    feedback_nodes = [m for m in mem if m["node_type"] == "feedback"]
+    by_name: dict[str, list[dict]] = defaultdict(list)
+    for m in feedback_nodes:
+        by_name[m["name"]].append(m)
+
     mem_report = []
     for c in mem_clusters:
         projects = {i["project"] for i in c["items"]}
@@ -394,7 +594,7 @@ def main() -> int:
     report: list[dict] = []
     stats = {"sessions": 0, "user_turns": 0, "projects": set(), "hits": 0}
     if not args.memory_only:
-        items, stats = collect_transcripts(root, args.min_score, args.max_chars,
+        items, stats = collect_transcripts(provider, root, args.min_score, args.max_chars,
                                            now, args.half_life, args.verbose)
         report = build_report(cluster(items, args.similarity, args.min_shared),
                               args.min_projects, args.top)
@@ -407,6 +607,17 @@ def main() -> int:
           f"{len(report)}")
     print(f"cross-project auto-memory clusters: {len(mem_report)}\n")
 
+    if not args.memory_only:
+        reps = verbatim_repeats(items)
+        if reps:
+            print("--- VERBATIM REPEATS across sessions (strongest signal) ---")
+            for r in reps[:8]:
+                print(f"[{r['times']}x, {r['sessions']} sessions, "
+                      f"{len(r['projects'])} project(s)] "
+                      f"{' '.join(r['text'].split())[:120]}")
+                print(f"   {r['citations'][0]}")
+            print()
+
     for i, r in enumerate(report, 1):
         print(f"{i}. [{r['project_count']} projects, {r['occurrences']}x, "
               f"score {r['recency_weighted_score']}] {' '.join(r['theme_tokens'])}")
@@ -416,6 +627,30 @@ def main() -> int:
             print(f"   · {e['text'][:110]}")
             print(f"     {e['citation']}")
         print()
+
+    if feedback_nodes:
+        print("--- PREFERENCE NODES (type: feedback) — verbatim, highest value ---")
+        for name, group in sorted(by_name.items(), key=lambda kv: -len(kv[1])):
+            repos = sorted({g["project"] for g in group})
+            stamp = next((g["modified"] for g in group if g["modified"]), "no stamp")
+            print(f"[{len(repos)} repo(s)] {name}   (modified {stamp})")
+            if group[0]["description"]:
+                print(f"   desc: {group[0]['description'][:140]}")
+            for line in group[0]["text"].splitlines()[:4]:
+                print(f"   . {line[:130]}")
+        print()
+    else:
+        print("--- no type: feedback memory nodes found ---")
+        print("    Preferences you state are saved as feedback nodes. If there")
+        print("    are none, say 'remember that ...' when you correct Claude.\n")
+
+    warn = project_independence_warning(stats["projects"])
+    if warn:
+        print("--- WARNING: these project labels look like the same work ---")
+        for a, b in warn[:6]:
+            print(f"   {a}\n   {b}")
+        print("    Cross-project counts across these are NOT evidence of a")
+        print("    universal rule. Treat them as one project.\n")
 
     if mem_report:
         print("--- auto memory, recurring across repos ---")
@@ -434,6 +669,11 @@ def main() -> int:
             "params": {k: v for k, v in vars(args).items() if k != "out"},
             "stats": {**{k: v for k, v in stats.items() if k != "projects"},
                       "projects": sorted(stats["projects"])},
+            "verbatim_repeats": (verbatim_repeats(items)
+                                 if not args.memory_only else []),
+            "preference_nodes": [{k: v for k, v in m.items()
+                                  if k != "tokens"}
+                                 for m in feedback_nodes],
             "transcript_clusters": report,
             "memory_clusters": mem_report,
         }
